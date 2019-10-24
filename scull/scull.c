@@ -25,19 +25,19 @@ static ssize_t scull_read(struct file *filp, char __user *buf, size_t count, lof
   size_t to_read, copied, retval;
 
   if (*f_pos >= SCULL_INT_BUFFER_SIZE) {
-    printk(KERN_ALERT "scull reached EOF\n");
+    printk(KERN_DEBUG "scull reached EOF\n");
     return 0;
   }
 
   to_read = scull_min(SCULL_INT_BUFFER_SIZE - *f_pos, count);
 
-  printk(KERN_ALERT "Attempting to read %lu\n", to_read);
+  printk(KERN_DEBUG "Attempting to read %lu\n", to_read);
 
   copied = copy_to_user(buf, int_buffer, to_read);
   if(copied)
-    printk(KERN_ALERT "Scull failed to copy %lu bytes\n", copied);
+    printk(KERN_DEBUG "Scull failed to copy %lu bytes\n", copied);
 
-  printk(KERN_ALERT "Read %lu\n", copied);
+  printk(KERN_DEBUG "Read %lu\n", copied);
 
   retval = to_read - copied;
   *f_pos += retval;
@@ -55,7 +55,7 @@ static ssize_t scull_write(struct file *filp, const char __user *buf, size_t cou
 
   copied = copy_from_user(int_buffer + *f_pos, buf, to_write);
   if(copied)
-    printk(KERN_ALERT "Scull failed to write %lu bytes\n", copied);
+    printk(KERN_DEBUG "Scull failed to write %lu bytes\n", copied);
 
   *f_pos += copied;
   return to_write - copied;
@@ -72,7 +72,7 @@ static int scull_init(void)
 {
   size_t i;
 
-  printk(KERN_ALERT "scull init\n");
+  printk(KERN_DEBUG "scull init\n");
 
   int_buffer = kmalloc(SCULL_INT_BUFFER_SIZE, GFP_KERNEL);
 
@@ -86,7 +86,7 @@ static int scull_init(void)
 
 static void scull_exit(void)
 {
-  printk(KERN_ALERT "scull exit\n");
+  printk(KERN_DEBUG "scull exit\n");
 
   if (scull_proc_entry)
     proc_remove(scull_proc_entry);
