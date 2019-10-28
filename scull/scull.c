@@ -97,7 +97,7 @@ static ssize_t scull_read(struct file *filp, char __user *buf, size_t count, lof
 	dptr = scull_follow(dev, item);
 
 	printk(KERN_DEBUG "dptr %p item %lu s_pos %lu q_pos %lu\n",
-					dptr, item, s_pos, q_pos);
+			dptr, item, s_pos, q_pos);
 
 	if (dptr == NULL || !dptr->data || !dptr->data[s_pos]) {
 		printk(KERN_DEBUG "EOF\n");
@@ -106,7 +106,7 @@ static ssize_t scull_read(struct file *filp, char __user *buf, size_t count, lof
 
 	if (count > quantum - q_pos)
 		count = quantum - q_pos;
-	
+
 	if (copy_to_user(buf, dptr->data[s_pos] + q_pos, count))
 		return -EFAULT;
 
@@ -146,7 +146,7 @@ static ssize_t scull_write(struct file *filp, const char __user *buf, size_t cou
 	dptr = scull_follow(dev, item);
 
 	printk(KERN_DEBUG "dptr %p item %lu s_pos %lu q_pos %lu\n",
-					dptr, item, s_pos, q_pos);
+			dptr, item, s_pos, q_pos);
 
 	if (dptr == NULL) {
 		dptr = scull_add_qset(dev);
@@ -190,6 +190,7 @@ static int get_dev(void)
 {
 	dev_t dev;
 
+
 	if (scull_major) {
 		dev = MKDEV(scull_major, scull_minor);
 		return register_chrdev_region(dev, 1 /* nr of devs */, "scull");
@@ -216,16 +217,16 @@ int scull_release(struct inode *inode, struct file *filp)
 
 static struct file_operations fops =
 {
-.owner = THIS_MODULE,
-.read = scull_read,
-.write = scull_write,
-.open = scull_open,
-.release = scull_release
+	.owner = THIS_MODULE,
+	.read = scull_read,
+	.write = scull_write,
+	.open = scull_open,
+	.release = scull_release
 };
 
 static int scull_init(void)
 {
-  printk(KERN_DEBUG "scull init\n");
+	printk(KERN_DEBUG "scull init\n");
 
 	if (get_dev()) {
 		printk(KERN_ERR "Failed to obtain dev major\n");
@@ -250,17 +251,17 @@ static int scull_init(void)
 		return -1;
 	}
 
-  pentry = proc_create("scullmem", 0777, NULL, &fops);
+	pentry = proc_create("scullmem", 0777, NULL, &fops);
 
 	if (unlikely(!pentry))
 		printk(KERN_ERR "Failed to create proc entry\n"); // continue even if failed
 
-  return 0;
+	return 0;
 }
 
 static void scull_exit(void)
 {
-  printk(KERN_DEBUG "scull exit\n");
+	printk(KERN_DEBUG "scull exit\n");
 
 	if (!sdev)
 		return;
@@ -268,8 +269,8 @@ static void scull_exit(void)
 	scull_trim(sdev);
 	cdev_del(&sdev->cdev);
 
-  if (pentry)
-    proc_remove(pentry);
+	if (pentry)
+		proc_remove(pentry);
 
 	kfree(sdev);
 }
