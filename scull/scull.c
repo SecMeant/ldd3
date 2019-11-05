@@ -88,8 +88,8 @@ static ssize_t scull_read(struct file *filp, char __user *buf, size_t count, lof
 	size_t item_size = quantum * qset;
 	size_t item, s_pos, q_pos, rest, retval;
 
-        if(mutex_lock_interruptible(&dev->lock))
-          return -ERESTARTSYS;
+	if(mutex_lock_interruptible(&dev->lock))
+		return -ERESTARTSYS;
 
 	item = *f_pos / item_size;
 	rest = *f_pos % item_size;
@@ -257,7 +257,7 @@ static int scull_init(void)
 	sdev->data = NULL;
 	sdev->quantum = SCULL_QUANTUM;
 	sdev->qset = SCULL_QSET;
-        mutex_init(&sdev->lock);
+	mutex_init(&sdev->lock);
 
 	cdev_init(&sdev->cdev, &fops);
 
