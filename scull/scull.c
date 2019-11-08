@@ -1,7 +1,7 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/kdev_t.h>
-#include <linux/semaphore.h>
+#include <linux/mutex.h>
 #include <linux/cdev.h>
 #include <linux/fs.h>
 #include <linux/proc_fs.h>
@@ -32,7 +32,7 @@ struct scull_dev
 	size_t qset;               /* the current array size */
 	unsigned long size;        /* amount of data stored here */
 	// unsigned int access_key;   /* used by sculluid and scullpriv */
-	// struct semaphore sem;      /* mutual exlusion semaphore */
+	struct mutex lock;      /* mutual exlusion semaphore */
 	struct cdev cdev;          /* Char device structure */
 };
 
@@ -86,7 +86,10 @@ static ssize_t scull_read(struct file *filp, char __user *buf, size_t count, lof
 	struct scull_qset *dptr;
 	size_t quantum = dev->quantum, qset = dev->qset;
 	size_t item_size = quantum * qset;
-	size_t item, s_pos, q_pos, rest;
+	size_t item, s_pos, q_pos, rest, retval;
+
+        if(mutex_lock_interruptible(&dev->lock))
+          return -ERESTARTSYS;
 
 	item = *f_pos / item_size;
 	rest = *f_pos % item_size;
@@ -101,17 +104,24 @@ static ssize_t scull_read(struct file *filp, char __user *buf, size_t count, lof
 
 	if (dptr == NULL || !dptr->data || !dptr->data[s_pos]) {
 		printk(KERN_DEBUG "EOF\n");
-		return 0;
+		retval = 0;
+		goto out;
 	}
 
 	if (count > quantum - q_pos)
 		count = quantum - q_pos;
 
-	if (copy_to_user(buf, dptr->data[s_pos] + q_pos, count))
-		return -EFAULT;
+	if (copy_to_user(buf, dptr->data[s_pos] + q_pos, count)) {
+		retval = -EFAULT;
+		goto out;
+	}
 
 	*f_pos += count;
-	return count;
+	retval = count;
+
+out:
+	mutex_unlock(&dev->lock);
+	return retval;
 }
 
 static struct scull_qset* scull_add_qset(struct scull_dev *dev)
@@ -135,7 +145,10 @@ static ssize_t scull_write(struct file *filp, const char __user *buf, size_t cou
 	size_t quantum = dev->quantum, qset = dev->qset;
 	size_t item_size = quantum * qset;
 	size_t qset_free_space;
-	size_t item, s_pos, q_pos, rest;
+	size_t item, s_pos, q_pos, rest, retval;
+
+	if(mutex_lock_interruptible(&dev->lock))
+		return -ERESTARTSYS;
 
 	item = *f_pos / item_size;
 	rest = *f_pos % item_size;
@@ -145,45 +158,48 @@ static ssize_t scull_write(struct file *filp, const char __user *buf, size_t cou
 
 	dptr = scull_follow(dev, item);
 
-	printk(KERN_DEBUG "dptr %p item %lu s_pos %lu q_pos %lu\n",
-			dptr, item, s_pos, q_pos);
-
 	if (dptr == NULL) {
 		dptr = scull_add_qset(dev);
-		if (dptr == NULL)
-			return -ENOMEM;
+		if (dptr == NULL) {
+			retval = -ENOMEM;
+			goto out;
+		}
 	}
-
-	printk(KERN_DEBUG "asdf\n");
 
 	if (!dptr->data) {
 		dptr->data = kzalloc(qset * sizeof(char *), GFP_KERNEL);
-		if (!dptr->data)
-			return -ENOMEM;
+		if (!dptr->data) {
+			retval = -ENOMEM;
+			goto out;
+		}
 	}
-
-	printk(KERN_DEBUG "qwer\n");
 
 	if (!dptr->data[s_pos]) {
 		dptr->data[s_pos] = kzalloc(quantum, GFP_KERNEL);
-		if (!dptr->data[s_pos])
-			return -ENOMEM;
+		if (!dptr->data[s_pos]) {
+			retval = -ENOMEM;
+			goto out;
+		}
 	}
-
-	printk(KERN_DEBUG "zxcv\n");
 
 	qset_free_space = quantum - q_pos;
 	if (count > qset_free_space)
 		count = qset_free_space;
 
-	if (copy_from_user(dptr->data[s_pos] + q_pos, buf, count))
-		return -EFAULT;
+	if (copy_from_user(dptr->data[s_pos] + q_pos, buf, count)) {
+		retval = -EFAULT;
+		goto out;
+	}
 
 	if (count == qset_free_space && !dptr->data)
 		dptr->data = kzalloc(qset * sizeof(char *), GFP_KERNEL);
 
 	*f_pos += count;
-	return count;
+	retval = count;
+
+out:
+	mutex_unlock(&dev->lock);
+	return retval;
 }
 
 static int get_dev(void)
@@ -204,14 +220,12 @@ int scull_open(struct inode *inode, struct file *filp)
 {
 	struct scull_dev *dev = container_of(inode->i_cdev, struct scull_dev, cdev);
 	filp->private_data = dev;
-	printk(KERN_DEBUG "Opening scull dev at %p\n", dev);
 
 	return 0;
 }
 
 int scull_release(struct inode *inode, struct file *filp)
 {
-	printk(KERN_DEBUG "Closing scull\n");
 	return 0;
 }
 
@@ -226,7 +240,7 @@ static struct file_operations fops =
 
 static int scull_init(void)
 {
-	printk(KERN_DEBUG "scull init\n");
+	printk(KERN_INFO "Loading scull\n");
 
 	if (get_dev()) {
 		printk(KERN_ERR "Failed to obtain dev major\n");
@@ -243,6 +257,7 @@ static int scull_init(void)
 	sdev->data = NULL;
 	sdev->quantum = SCULL_QUANTUM;
 	sdev->qset = SCULL_QSET;
+        mutex_init(&sdev->lock);
 
 	cdev_init(&sdev->cdev, &fops);
 
@@ -261,7 +276,7 @@ static int scull_init(void)
 
 static void scull_exit(void)
 {
-	printk(KERN_DEBUG "scull exit\n");
+	printk(KERN_INFO "Removing scull\n");
 
 	if (!sdev)
 		return;
