@@ -4,6 +4,8 @@
 #include <linux/cdev.h>
 #include <linux/slab.h>
 #include <linux/kdev_t.h>
+#include <linux/compiler_attributes.h>
+#include <linux/semaphore.h>
 
 #define SCULLP_BUF_SIZE 512
 
@@ -18,6 +20,8 @@ int scullpipe_write (struct file *, const char __user *, size_t, loff_t *);
 struct scullpipe_dev {
 	struct cdev cdev;
 	char *bb, *wp, *rp;
+	struct semaphore wsem;
+	wait_queue_head_t rq, wq;
 };
 
 struct scullpipe_dev *sdev;
@@ -40,6 +44,60 @@ int scullpipe_release (struct inode *inode, struct file *filp)
 {
 	printk(KERN_DEBUG "Scullpipe release");
 	return 0;
+}
+
+static __always_inline size_t readavail(const scullpipe_dev *sdev)
+{
+	if (sdev->wp < sdev->rp)
+		return (sdev->bb - sdev->rp) + SCULLP_BUF_SIZE; // I hope this prevents overflow to happen
+	return sdev->wr - sdev->rp;
+}
+
+static __always_inline size_t scullmin(size_t a, size_t b)
+{
+	a = b < a ? b : a;
+	return a;
+}
+
+int scullpipe_read (struct file *filp, char __user *to, size_t count, loff_t off)
+{
+	struct scullpipe_dev *sdev = (struct scullpipe_dev *) filp->private_data;
+
+	if (down_interruptible(&sdev->wsem))
+		return -ERESTARTSYS;
+
+	while (sdev->rp == sdev->wp) {
+		up(&sdev->wsem);
+
+		if (sdev->f_flags & O_NONBLOCK)
+			return -EAGAIN;
+
+		if (wait_event_interruptible(sdev->wsem, (sdev->rp != sdev->wp)))
+			return -ERESTARTSYS;
+
+		if (down_interruptible(&sdev->wsem))
+			return -ERESTARTSYS;
+	}
+
+	// There is data to read and semaphore is aquired
+	
+	count = scullmin(count, readavail());
+
+	if (copy_to_user(to, dev->rp, count)) {
+		up (&sdev->wsem);
+		return -EFAULT;
+	}
+
+	sdev->rp += count;
+
+	if (sdev->rp == sdev->bb + SCULLP_BUF_SIZE)
+		sdev->rp = sdev->bb;
+
+	up(&sdev->wsem);
+
+	wake_up_interruptible(&sdev->wq);
+
+	return count;
 }
 
 static int scullpipe_init(void)
@@ -88,6 +146,9 @@ static int scullpipe_init(void)
 		kfree(sdev);
 		return ret;
 	}
+
+	init_waitqueuea_head(sdev->wq);
+	init_waitqueuea_head(sdev->rq);
 
 	return 0;
 }
