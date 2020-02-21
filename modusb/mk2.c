@@ -146,6 +146,52 @@ static void mk2_write_bulk_callback(struct urb *urb)
 	up(&dev->limit_sem);
 }
 
+static void stuff_buffer(char *buf, size_t stuffed_size, const char __user *user_buffer, size_t count)
+{
+	size_t blk, rem, oi = 0, ii = 0;
+
+	blk = count / 3;
+	rem = count % 3;
+
+	while (blk > 0) {
+		buf[oi+0] = MK2_SYSEX_MOREDATA;
+		buf[oi+1] = user_buffer[ii+0];
+		buf[oi+2] = user_buffer[ii+1];
+		buf[oi+3] = user_buffer[ii+2];
+		
+		oi += 4;
+		ii += 3;
+		--blk;
+	}
+
+	switch (rem) {
+		case 0:
+			buf[oi-4] = MK2_SYSEX_DATAEND3;
+			break;
+		case 1:
+			buf[oi+0] = MK2_SYSEX_DATAEND1;
+			buf[oi+1] = user_buffer[ii+0];
+			buf[oi+2] = 0;
+			buf[oi+3] = 0;
+			break;
+		case 2:
+			buf[oi+0] = MK2_SYSEX_DATAEND2;
+			buf[oi+1] = user_buffer[ii+0];
+			buf[oi+2] = user_buffer[ii+1];
+			buf[oi+3] = 0;
+			break;
+		default:
+			break;
+	}
+
+	print_hex_dump(KERN_DEBUG, "mk2 write (raw): ", DUMP_PREFIX_ADDRESS,
+			16, 1, user_buffer, count, true);
+
+	print_hex_dump(KERN_DEBUG, "mk2 write: ", DUMP_PREFIX_ADDRESS,
+			16, 1, buf, stuffed_size, true);
+
+}
+
 static ssize_t mk2_write(struct file *filp, const char __user *user_buffer, size_t count, loff_t *ppos)
 {
 	struct mk2dev *dev;
@@ -212,7 +258,7 @@ static ssize_t mk2_write(struct file *filp, const char __user *user_buffer, size
 		goto error;
 	}
 
-	stuff_buffer(buf, user_buffer, count);
+	stuff_buffer(buf, stuffed_size, user_buffer, count);
 
 	mutex_lock(&dev->io_mutex);
 	if (unlikely(dev->disconnected)) {
@@ -269,7 +315,7 @@ static const struct file_operations mk2_fops = {
 };
 
 static struct usb_class_driver mk2_class = {
-	.name =		"skel%d",
+	.name =		"mk2-%d",
 	.fops =		&mk2_fops,
 	.minor_base = 	USB_MK2_MINOR_BASE,
 };
@@ -356,7 +402,7 @@ static void mk2_disconnect(struct usb_interface *interface)
 	usb_kill_anchored_urbs(&dev->submitted);
 
 	kref_put(&dev->kref, mk2_delete);
-	dev_info(&interface->dev, "USB Skeleton #%d now disconnceted", minor);
+	dev_info(&interface->dev, "USB mk2 #%d now disconnceted", minor);
 }
 
 static struct usb_driver mk2_driver = {

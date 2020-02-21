@@ -1,7 +1,7 @@
 ifneq ($(KERNELRELEASE),)
 	obj-m := mk2.o
 else
-	KERNELDIR ?= /lib/modules/5.6.0-rc2+/build
+	KERNELDIR ?= /lib/modules/$(shell uname -r)/build
 	PWD := $(shell pwd)
 default:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules
