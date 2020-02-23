@@ -299,10 +299,143 @@ exit:
 	return retval;
 }
 
+static void mk2_read_bulk_callback(struct urb *urb)
+{
+	struct mk2dev *dev;
+	unsigned long flags;
+
+	dev = urb->context;
+
+	spin_lock_irqsave(&dev->err_lock, flags);
+
+	if (urb->status) {
+		if (!(	urb->status == -ENOENT ||
+			urb->status == -ECONNRESET ||
+			urb->status == -ESHUTDOWN))
+				dev_err(&dev->interface->dev,
+					"%s - nonzero write bulk status received: %d\n",
+					__func__, urb->status);
+
+		dev->errors = urb->status;
+	} else {
+		dev->bulk_in_filled = urb->actual_length;
+	}
+	dev->ongoing_read = 0;
+	spin_unlock_irqrestore(&dev->err_lock, flags);
+	wake_up_interruptible(&dev->bulk_in_wait);
+}
+
+static int mk2_read_(struct mk2dev *dev, size_t count)
+{
+	int retval;
+
+	usb_fill_bulk_urb(dev->bulk_in_urb,
+			dev->udev,
+			usb_rcvbulkpipe(dev->udev,
+				dev->bulk_in_endpointAddr),
+			dev->bulk_in_buffer,
+			min(dev->bulk_in_size, count),
+			mk2_read_bulk_callback,
+			dev);
+
+	spin_lock_irq(&dev->err_lock);
+	dev->ongoing_read = 1;
+	spin_unlock_irq(&dev->err_lock);
+
+	dev->bulk_in_filled = 0;
+	dev->bulk_in_copied = 0;
+
+	retval = usb_submit_urb(dev->bulk_in_urb, GFP_KERNEL);
+	if (retval < 0) {
+		dev_err(&dev->interface->dev,
+			"%s - failed submitting read urb, error %d\n",
+			__func__, retval);
+		retval = (retval == -ENOMEM) ? retval : -EIO;
+		spin_lock_irq(&dev->err_lock);
+		dev->ongoing_read = 0;
+		spin_unlock_irq(&dev->err_lock);
+	}
+
+	return retval;
+}
+
 static ssize_t mk2_read(struct file *filp, char __user *user_buffer, size_t count, loff_t *ppos)
 {
-	// clear_user already checks access_ok
-	return clear_user(user_buffer,count);
+	struct mk2dev *dev;
+	int retval;
+	bool ongoing_io;
+
+	dev = filp->private_data;
+
+	if (!count)
+		return -EINVAL;
+
+	retval = mutex_lock_interruptible(&dev->io_mutex);
+	if (retval < 0)
+		return retval;
+	
+	if (dev->disconnected) {
+		retval = -ENODEV;
+		goto exit;
+	}
+
+retry:
+	spin_lock_irq(&dev->err_lock);
+	ongoing_io = dev->ongoing_read;
+	spin_unlock_irq(&dev->err_lock);
+
+	if (ongoing_io) {
+		if (filp->f_flags & O_NONBLOCK) {
+			retval = -EAGAIN;
+			goto exit;
+		}
+
+		retval = wait_event_interruptible(dev->bulk_in_wait, (!dev->ongoing_read));
+		if (retval < 0)
+			goto exit;
+	}
+
+	retval = dev->errors;
+	if (retval < 0) {
+		dev->errors = 0;
+		retval = (retval == -EPIPE) ? retval : -EIO;
+		goto exit;
+	}
+
+	if (dev->bulk_in_filled) {
+		size_t available = dev->bulk_in_filled - dev->bulk_in_copied;
+		size_t chunk = min(available, count);
+
+		if (!available) {
+			retval = mk2_read_(dev, count);
+			if (retval < 0)
+				goto exit;
+			else
+				goto retry;
+		}
+
+		if (copy_to_user(user_buffer,
+				 dev->bulk_in_buffer + dev->bulk_in_copied,
+				 chunk))
+			retval = -EFAULT;
+		else
+			retval = chunk;
+
+		dev-> bulk_in_copied += chunk;
+
+		if (available < count)
+			mk2_read_(dev, count - chunk);
+	} else {
+		retval = mk2_read_(dev, count);
+		if (retval < 0)
+			goto exit;
+		else
+			goto retry;
+	}
+
+exit:
+	mutex_unlock(&dev->io_mutex);
+	return retval;
 }
 
 static const struct file_operations mk2_fops = {
