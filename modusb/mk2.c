@@ -33,26 +33,61 @@
 
 static struct usb_driver mk2_driver;
 
+struct mk2_read_buffer
+{
+	unsigned char	*data;
+	size_t		size;
+	size_t		filled;
+	size_t		copied;
+};
+
+void *mk2_read_buffer_alloc(struct mk2_read_buffer *read_buffer, size_t size)
+{
+	read_buffer->data = kmalloc(size, GFP_KERNEL);
+	read_buffer->size = size;
+	read_buffer->filled = 0;
+	read_buffer->copied = 0;
+
+	return read_buffer->data;
+}
+
+struct mk2_read_endp
+{
+	struct mk2_read_buffer	buffer;
+	struct urb		*urb;
+	struct mutex		io_mutex;
+	wait_queue_head_t	wait_queue;
+	spinlock_t 		err_lock;
+	int 			errors;
+	__u8			address;
+	bool			requested_read;
+};
+
+struct mk2_write_endp
+{
+	struct usb_anchor	submitted;
+	struct semaphore	limit_sem;
+	struct mutex		io_mutex;
+	spinlock_t		err_lock;
+	int errors;
+	__u8			address;
+};
+
+struct mk2_state
+{
+	unsigned long
+		disconnected 	: 1;
+		//suspended 	: 1;
+};
+
 struct mk2dev
 {
 	struct usb_device	*udev;
 	struct usb_interface	*interface;
-	struct semaphore	limit_sem;
-	struct usb_anchor	submitted;
-	struct urb		*bulk_in_urb;
-	unsigned char		*bulk_in_buffer;
-	size_t			bulk_in_size;
-	size_t			bulk_in_filled;
-	size_t			bulk_in_copied;
-	__u8			bulk_in_endpointAddr;
-	__u8			bulk_out_endpointAddr;
-	int			errors;
-	bool			ongoing_read;
-	spinlock_t		err_lock;
 	struct kref		kref;
-	struct mutex		io_mutex;
-	unsigned long		disconnected : 1;
-	wait_queue_head_t	bulk_in_wait;
+	struct mk2_read_endp	read_endp;
+	struct mk2_write_endp	write_endp;
+	struct mk2_state	state;
 };
 
 static const struct usb_device_id mk2_idtable[] = {
@@ -65,10 +100,10 @@ static void mk2_delete(struct kref *kref)
 {
 	struct mk2dev *dev = container_of(kref, struct mk2dev, kref);
 
-	usb_free_urb(dev->bulk_in_urb);
+	usb_free_urb(dev->read_endp.urb);
 	usb_put_intf(dev->interface);
 	usb_put_dev(dev->udev);
-	kfree(dev->bulk_in_buffer);
+	kfree(dev->read_endp.buffer.data);
 	kfree(dev);
 }
 
@@ -124,9 +159,11 @@ static int mk2_release(struct inode *inode, struct file *file)
 static void mk2_write_bulk_callback(struct urb *urb)
 {
 	struct mk2dev *dev;
+	struct mk2_write_endp *endpoint;
 	unsigned long flags;
 
 	dev = urb->context;
+	endpoint = &dev->write_endp;
 
 	if (urb->status) {
 		if (!(urb->status == -ENOENT ||
@@ -136,14 +173,14 @@ static void mk2_write_bulk_callback(struct urb *urb)
 					"%s - nonzero write bulk status received: %d\n",
 					__func__, urb->status);
 
-		spin_lock_irqsave(&dev->err_lock, flags);
-		dev->errors = urb->status;
-		spin_unlock_irqrestore(&dev->err_lock, flags);
+		spin_lock_irqsave(&endpoint->err_lock, flags);
+		endpoint->errors = urb->status;
+		spin_unlock_irqrestore(&endpoint->err_lock, flags);
 	}
 
 	usb_free_coherent(urb->dev, urb->transfer_buffer_length,
 			  urb->transfer_buffer, urb->transfer_dma);
-	up(&dev->limit_sem);
+	up(&endpoint->limit_sem);
 }
 
 static void stuff_buffer(char *buf, size_t stuffed_size, const char __user *user_buffer, size_t count)
@@ -195,6 +232,7 @@ static void stuff_buffer(char *buf, size_t stuffed_size, const char __user *user
 static ssize_t mk2_write(struct file *filp, const char __user *user_buffer, size_t count, loff_t *ppos)
 {
 	struct mk2dev *dev;
+	struct mk2_write_endp *endpoint;
 	struct urb *urb = NULL;
 	char *buf = NULL;
 	ssize_t stuffed_size, retval = 0;
@@ -217,26 +255,27 @@ static ssize_t mk2_write(struct file *filp, const char __user *user_buffer, size
 
 
 	dev = filp->private_data;
+	endpoint = &dev->write_endp;
 
 	if (!(filp->f_flags & O_NONBLOCK)) {
-		if (down_interruptible(&dev->limit_sem)) {
+		if (down_interruptible(&endpoint->limit_sem)) {
 			retval = -ERESTARTSYS;
 			goto exit;
 		}
 	} else {
-		if (down_trylock(&dev->limit_sem)) {
+		if (down_trylock(&endpoint->limit_sem)) {
 			retval = -EAGAIN;
 			goto exit;
 		}
 	}
 
-	spin_lock_irq(&dev->err_lock);
-	retval = dev->errors;
+	spin_lock_irq(&endpoint->err_lock);
+	retval = endpoint->errors;
 	if (retval < 0) {
-		dev->errors = 0;
+		endpoint->errors = 0;
 		retval = (retval == -EPIPE) ? retval : -EIO;
 	}
-	spin_unlock_irq(&dev->err_lock);
+	spin_unlock_irq(&endpoint->err_lock);
 	if (retval < 0)
 		goto error;
 	
@@ -260,21 +299,21 @@ static ssize_t mk2_write(struct file *filp, const char __user *user_buffer, size
 
 	stuff_buffer(buf, stuffed_size, user_buffer, count);
 
-	mutex_lock(&dev->io_mutex);
-	if (unlikely(dev->disconnected)) {
-		mutex_unlock(&dev->io_mutex);
+	mutex_lock(&endpoint->io_mutex);
+	if (unlikely(dev->state.disconnected)) {
+		mutex_unlock(&endpoint->io_mutex);
 		retval = -ENODEV;
 		goto error;
 	}
 
 	usb_fill_bulk_urb(urb, dev->udev,
-			  usb_sndbulkpipe(dev->udev, dev->bulk_out_endpointAddr),
+			  usb_sndbulkpipe(dev->udev, endpoint->address),
 			  buf, stuffed_size, mk2_write_bulk_callback, dev);
 	urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
-	usb_anchor_urb(urb, &dev->submitted);
+	usb_anchor_urb(urb, &endpoint->submitted);
 
 	retval = usb_submit_urb(urb, GFP_KERNEL);
-	mutex_unlock(&dev->io_mutex);
+	mutex_unlock(&endpoint->io_mutex);
 	if (retval) {
 		dev_err(&dev->interface->dev,
 			"%s - failed to submit write urb, error %lu\n",
@@ -293,7 +332,7 @@ error:
 		usb_free_coherent(dev->udev, stuffed_size, buf, urb->transfer_dma);
 		usb_free_urb(urb);
 	}
-	up(&dev->limit_sem);
+	up(&endpoint->limit_sem);
 
 exit:
 	return retval;
@@ -302,11 +341,11 @@ exit:
 static void mk2_read_bulk_callback(struct urb *urb)
 {
 	struct mk2dev *dev;
-	unsigned long flags;
+	unsigned long irqstate;
 
 	dev = urb->context;
 
-	spin_lock_irqsave(&dev->err_lock, flags);
+	spin_lock_irqsave(&dev->read_endp.err_lock, irqstate);
 
 	if (urb->status) {
 		if (!(	urb->status == -ENOENT ||
@@ -316,44 +355,48 @@ static void mk2_read_bulk_callback(struct urb *urb)
 					"%s - nonzero write bulk status received: %d\n",
 					__func__, urb->status);
 
-		dev->errors = urb->status;
+		dev->read_endp.errors = urb->status;
 	} else {
-		dev->bulk_in_filled = urb->actual_length;
+		dev->read_endp.buffer.filled = urb->actual_length;
 	}
-	dev->ongoing_read = 0;
-	spin_unlock_irqrestore(&dev->err_lock, flags);
-	wake_up_interruptible(&dev->bulk_in_wait);
+	dev->read_endp.requested_read = 0;
+	spin_unlock_irqrestore(&dev->read_endp.err_lock, irqstate);
+	wake_up_interruptible(&dev->read_endp.wait_queue);
 }
 
-static int mk2_read_(struct mk2dev *dev, size_t count)
+static int mk2_request_read(struct mk2_read_endp *endpoint, size_t count)
 {
+	struct mk2dev *dev;
 	int retval;
 
-	usb_fill_bulk_urb(dev->bulk_in_urb,
+	dev = container_of(endpoint, struct mk2dev, read_endp);
+
+	usb_fill_bulk_urb(endpoint->urb,
 			dev->udev,
-			usb_rcvbulkpipe(dev->udev,
-				dev->bulk_in_endpointAddr),
-			dev->bulk_in_buffer,
-			min(dev->bulk_in_size, count),
+			usb_rcvbulkpipe(dev->udev, endpoint->address),
+			endpoint->buffer.data,
+			min(endpoint->buffer.size, count),
 			mk2_read_bulk_callback,
 			dev);
 
-	spin_lock_irq(&dev->err_lock);
-	dev->ongoing_read = 1;
-	spin_unlock_irq(&dev->err_lock);
+	spin_lock_irq(&endpoint->err_lock);
+	endpoint->requested_read = 1;
+	spin_unlock_irq(&endpoint->err_lock);
 
-	dev->bulk_in_filled = 0;
-	dev->bulk_in_copied = 0;
+	endpoint->buffer.filled = 0;
+	endpoint->buffer.copied = 0;
 
-	retval = usb_submit_urb(dev->bulk_in_urb, GFP_KERNEL);
+	retval = usb_submit_urb(endpoint->urb, GFP_KERNEL);
 	if (retval < 0) {
 		dev_err(&dev->interface->dev,
 			"%s - failed submitting read urb, error %d\n",
 			__func__, retval);
+
 		retval = (retval == -ENOMEM) ? retval : -EIO;
-		spin_lock_irq(&dev->err_lock);
-		dev->ongoing_read = 0;
-		spin_unlock_irq(&dev->err_lock);
+
+		spin_lock_irq(&endpoint->err_lock);
+		endpoint->requested_read = 0;
+		spin_unlock_irq(&endpoint->err_lock);
 	}
 
 	return retval;
@@ -362,71 +405,73 @@ static int mk2_read_(struct mk2dev *dev, size_t count)
 static ssize_t mk2_read(struct file *filp, char __user *user_buffer, size_t count, loff_t *ppos)
 {
 	struct mk2dev *dev;
+	struct mk2_read_endp *endpoint;
 	int retval;
-	bool ongoing_io;
+	size_t leftover;
+	bool requested_read;
 
 	dev = filp->private_data;
+	endpoint = &dev->read_endp;
 
 	if (!count)
 		return -EINVAL;
 
-	retval = mutex_lock_interruptible(&dev->io_mutex);
+	retval = mutex_lock_interruptible(&endpoint->io_mutex);
 	if (retval < 0)
 		return retval;
 	
-	if (dev->disconnected) {
+	if (dev->state.disconnected) {
 		retval = -ENODEV;
 		goto exit;
 	}
 
 retry:
-	spin_lock_irq(&dev->err_lock);
-	ongoing_io = dev->ongoing_read;
-	spin_unlock_irq(&dev->err_lock);
+	spin_lock_irq(&endpoint->err_lock);
+	requested_read = endpoint->requested_read;
+	spin_unlock_irq(&endpoint->err_lock);
 
-	if (ongoing_io) {
+	if (requested_read) {
 		if (filp->f_flags & O_NONBLOCK) {
 			retval = -EAGAIN;
 			goto exit;
 		}
 
-		retval = wait_event_interruptible(dev->bulk_in_wait, (!dev->ongoing_read));
+		retval = wait_event_interruptible(endpoint->wait_queue,
+						(!endpoint->requested_read));
+						// not needed parenthesis ?
 		if (retval < 0)
 			goto exit;
 	}
 
-	retval = dev->errors;
+	// At this point no read is requested.
+	// One was never started or returned.
+	// So check for errors.
+	retval = endpoint->errors;
 	if (retval < 0) {
-		dev->errors = 0;
+		endpoint->errors = 0;
 		retval = (retval == -EPIPE) ? retval : -EIO;
 		goto exit;
 	}
 
-	if (dev->bulk_in_filled) {
-		size_t available = dev->bulk_in_filled - dev->bulk_in_copied;
-		size_t chunk = min(available, count);
-
-		if (!available) {
-			retval = mk2_read_(dev, count);
-			if (retval < 0)
-				goto exit;
-			else
-				goto retry;
-		}
+	// If data was read from device but not copied to user last time
+	// its still in the buffer, return leftover to the user.
+	// Otherwise immediately start read_request and try again.
+	leftover = endpoint->buffer.filled - endpoint->buffer.copied;
+	if (leftover) {
+		size_t n = min(leftover, count);
 
 		if (copy_to_user(user_buffer,
-				 dev->bulk_in_buffer + dev->bulk_in_copied,
-				 chunk))
+				 endpoint->buffer.data + endpoint->buffer.copied, n))
 			retval = -EFAULT;
 		else
-			retval = chunk;
+			retval = n;
 
-		dev-> bulk_in_copied += chunk;
+		endpoint->buffer.copied += n;
 
-		if (available < count)
-			mk2_read_(dev, count - chunk);
+		if (leftover < count)
+			mk2_request_read(endpoint, count - n);
 	} else {
-		retval = mk2_read_(dev, count);
+		retval = mk2_request_read(endpoint, count);
 		if (retval < 0)
 			goto exit;
 		else
@@ -434,7 +479,7 @@ retry:
 	}
 
 exit:
-	mutex_unlock(&dev->io_mutex);
+	mutex_unlock(&endpoint->io_mutex);
 	return retval;
 }
 
@@ -464,12 +509,19 @@ static int mk2_probe(struct usb_interface *interface,
 	if (!dev)
 		return -ENOMEM;
 
+	// Initialize base kernel structures
 	kref_init(&dev->kref);
-	sema_init(&dev->limit_sem, WRITES_IN_FLIGHT);
-	mutex_init(&dev->io_mutex);
-	spin_lock_init(&dev->err_lock);
-	init_usb_anchor(&dev->submitted);
-	init_waitqueue_head(&dev->bulk_in_wait);
+
+	// Initialize read endpoints kernel structures
+	mutex_init(&dev->read_endp.io_mutex);
+	init_waitqueue_head(&dev->read_endp.wait_queue);
+	spin_lock_init(&dev->read_endp.err_lock);
+
+	// Initialize write endpoints kernel structures
+	init_usb_anchor(&dev->write_endp.submitted);
+	sema_init(&dev->write_endp.limit_sem, WRITES_IN_FLIGHT);
+	mutex_init(&dev->write_endp.io_mutex);
+	spin_lock_init(&dev->write_endp.err_lock);
 
 	dev->udev = usb_get_dev(interface_to_usbdev(interface));
 	dev->interface = usb_get_intf(interface);
@@ -482,20 +534,18 @@ static int mk2_probe(struct usb_interface *interface,
 		goto error;
 	}
 
-	dev->bulk_in_size = usb_endpoint_maxp(bulk_in);
-	dev->bulk_in_endpointAddr = bulk_in->bEndpointAddress;
-	dev->bulk_in_buffer = kmalloc(dev->bulk_in_size, GFP_KERNEL);
-	if (!dev->bulk_in_buffer) {
+	dev->read_endp.address = bulk_in->bEndpointAddress;
+	if (!mk2_read_buffer_alloc(&dev->read_endp.buffer, usb_endpoint_maxp(bulk_in))) {
 		retval = -ENOMEM;
 		goto error;
 	}
-	dev->bulk_in_urb = usb_alloc_urb(0, GFP_KERNEL);
-	if (!dev->bulk_in_urb) {
+	dev->read_endp.urb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!dev->read_endp.urb) {
 		retval = -ENOMEM;
 		goto error;
 	}
 
-	dev->bulk_out_endpointAddr = bulk_out->bEndpointAddress;
+	dev->write_endp.address = bulk_out->bEndpointAddress;
 
 	usb_set_intfdata(interface, dev);
 
@@ -527,12 +577,14 @@ static void mk2_disconnect(struct usb_interface *interface)
 
 	usb_deregister_dev(interface, &mk2_class);
 
-	mutex_lock(&dev->io_mutex);
-	dev->disconnected = 1;
-	mutex_unlock(&dev->io_mutex);
+	mutex_lock(&dev->read_endp.io_mutex);
+	mutex_lock(&dev->write_endp.io_mutex);
+	dev->state.disconnected = 1;
+	mutex_unlock(&dev->write_endp.io_mutex);
+	mutex_unlock(&dev->read_endp.io_mutex);
 
-	usb_kill_urb(dev->bulk_in_urb);
-	usb_kill_anchored_urbs(&dev->submitted);
+	usb_kill_urb(dev->read_endp.urb);
+	usb_kill_anchored_urbs(&dev->write_endp.submitted);
 
 	kref_put(&dev->kref, mk2_delete);
 	dev_info(&interface->dev, "USB mk2 #%d now disconnceted", minor);
